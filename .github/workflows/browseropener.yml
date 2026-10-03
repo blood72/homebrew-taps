@@ -1,0 +1,93 @@
+name: BrowserOpener cask
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - Casks/browseropener.rb
+      - .github/workflows/browseropener.yml
+  push:
+    branches: [main]
+    paths:
+      - Casks/browseropener.rb
+      - .github/workflows/browseropener.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check runner and register the PR cask
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sw_vers
+          brew --version
+          brew tap --custom-remote blood72/taps "$GITHUB_WORKSPACE"
+          cmp Casks/browseropener.rb "$(brew --repository blood72/taps)/Casks/browseropener.rb"
+
+      - name: Style and online audit
+        run: |
+          set -euo pipefail
+          brew style Casks/browseropener.rb
+          brew audit --cask --strict --online blood72/taps/browseropener
+
+      - name: Verify public DMG and app bundle
+        run: |
+          set -euo pipefail
+          dmg="$RUNNER_TEMP/BrowserOpener-1.0.2.dmg"
+          mount="$RUNNER_TEMP/browseropener-dmg"
+          curl --fail --location --retry 2 --output "$dmg" \
+            https://github.com/blood72/BrowserOpener/releases/download/1.0.2/BrowserOpener-1.0.2.dmg
+          printf '%s  %s\n' \
+            1b7c4eb2098cb6a8a0eef1786a3a480cb07eccf96dd0b4a5dc7a15beb4e3deb7 "$dmg" | shasum -a 256 --check
+          mkdir "$mount"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount"' EXIT
+          app="$mount/BrowserOpener.app"
+          plist="$app/Contents/Info.plist"
+          test -d "$app"
+          test "$(readlink "$mount/Applications")" = /Applications
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = 1.0.2
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")" = 13.0
+          test "$(lipo -archs "$app/Contents/MacOS/BrowserOpener")" = arm64
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --verbose=4 "$app" 2> "$RUNNER_TEMP/browseropener-signature.txt"
+          cat "$RUNNER_TEMP/browseropener-signature.txt"
+          grep -q '^Signature=adhoc$' "$RUNNER_TEMP/browseropener-signature.txt"
+
+      - name: Install in an isolated directory with quarantine enabled
+        run: |
+          set -euo pipefail
+          appdir="$RUNNER_TEMP/browseropener-apps"
+          mkdir "$appdir"
+          brew install --cask --appdir="$appdir" blood72/taps/browseropener
+          app="$appdir/BrowserOpener.app"
+          test -d "$app"
+          brew list --cask blood72/taps/browseropener
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xattr -p com.apple.quarantine "$app"
+          printf 'Installation succeeded; quarantine is present.\n' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          spctl --assess --type execute --verbose=4 "$app" > "$RUNNER_TEMP/browseropener-gatekeeper.txt" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/browseropener-gatekeeper.txt"
+          printf 'Gatekeeper assessment exit status: %s\n' "$status" >> "$GITHUB_STEP_SUMMARY"
+          # An unsigned/unnotarized rejection is expected, but other errors must fail CI.
+          test "$status" = 3
+          grep -q 'rejected' "$RUNNER_TEMP/browseropener-gatekeeper.txt"
+          printf 'Gatekeeper rejected the ad-hoc, unnotarized app as expected. App launch and browser interaction were not tested.\n' >> "$GITHUB_STEP_SUMMARY"
